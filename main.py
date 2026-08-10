@@ -171,8 +171,12 @@ def format_progress(checked, speed=0, found=0, target=None, mode=None, length=No
 
 # ── SSRF guard ─────────────────────────────────────────────────────────────
 def is_safe_url(url: str) -> bool:
+    """Basic SSRF guard. Allows private IPs since WiFi portals are local."""
     try:
         parsed = urlparse(url)
+        if not parsed.scheme:
+            # Relative URL (e.g. /auth?sessionId=xxx) - safe
+            return True
         if parsed.scheme not in ("http", "https"):
             return False
         host = parsed.hostname or ""
@@ -180,13 +184,8 @@ def is_safe_url(url: str) -> bool:
             return False
         if host.lower() in ("localhost", "0.0.0.0"):
             return False
-        try:
-            addr = ipaddress.ip_address(host)
-            if any([addr.is_loopback, addr.is_private, addr.is_link_local,
-                    addr.is_reserved, addr.is_unspecified, addr.is_multicast]):
-                return False
-        except ValueError:
-            pass
+        # NOTE: We do NOT block private IPs here because Ruijie WiFiDog
+        # portals are typically on private networks (192.168.x.x, 10.x.x.x)
         return True
     except Exception:
         return False
@@ -259,23 +258,58 @@ async def Varify_Captcha(session_obj, session_id, text):
         return session_id if data.get("success") == True else None
 
 async def check_session_url(session_url):
+    logger.info(f"check_session_url: checking {session_url}")
     if not is_safe_url(session_url):
-        logger.warning(f"check_session_url: URL not safe")
+        logger.warning(f"check_session_url: URL not safe: {session_url}")
         return False
-    headers = {'accept': 'text/html,*/*;q=0.8',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    # Method 1: Try to get sessionId with random MAC (same as brute force logic)
+    test_url = replace_mac(session_url, get_mac())
+    headers = {
+        'accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
     try:
-        async with session.get(session_url, allow_redirects=False, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=15)) as first:
-            location = first.headers.get("Location", "")
-            if location and is_safe_url(location):
-                async with session.get(location, allow_redirects=False, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    return "sessionId" in str(resp.url) or "sessionId" in location
-            return "sessionId" in str(first.url) or "sessionId" in location
+        async with session.get(test_url, allow_redirects=True, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            final_url = str(resp.url)
+            text = await resp.text()
+            status = resp.status
+
+            # Check sessionId in URL via regex
+            sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", final_url)
+            if sid:
+                logger.info(f"check_session_url: sessionId found in URL: {sid.group(1)}")
+                return True
+
+            # Check sessionId in response body
+            if "sessionId" in text:
+                logger.info("check_session_url: sessionId found in response body")
+                return True
+
+            logger.warning(f"check_session_url: no sessionId. status={status}, url={final_url[:200]}")
+    except asyncio.TimeoutError:
+        logger.warning("check_session_url: timeout - trying fallback validation")
     except Exception as e:
-        logger.error(f"check_session_url error: {type(e).__name__}: {e}")
-        return False
+        logger.warning(f"check_session_url: request failed: {type(e).__name__}: {e}")
+
+    # Method 2: Fallback - validate URL structure (WiFiDog/Ruijie params)
+    try:
+        parsed = urlparse(session_url)
+        qs = parsed.query
+        # Look for typical Ruijie/WiFiDog parameters
+        wifi_params = ['gw_id', 'mac', 'gw_address', 'ip', 'nasip', 'gw_sn']
+        found = [p for p in wifi_params if f"{p}=" in qs]
+        if len(found) >= 3:
+            logger.info(f"check_session_url: fallback OK ({len(found)} WiFiDog params found)")
+            return True
+        else:
+            logger.warning(f"check_session_url: fallback failed - only {len(found)} params: {found}")
+    except Exception as e:
+        logger.warning(f"check_session_url: fallback error: {e}")
+
+    logger.error("check_session_url: URL validation failed")
+    return False
 
 # ── Core voucher check ─────────────────────────────────────────────────────
 POST_URL = base64.b64decode(
