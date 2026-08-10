@@ -23,20 +23,17 @@ ADMIN_ID    = os.environ.get("ADMIN_ID", "").strip()
 PORT        = int(os.environ.get("PORT", "8080"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "60"))
 
-# Auto-detect Railway domain (Railway sets this automatically)
-RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "").strip()
-
-# Build webhook URL: prefer explicit WEBHOOK_URL, fallback to Railway auto-domain
-WEBHOOK_BASE = WEBHOOK_URL or (f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else "")
-USE_WEBHOOK = bool(WEBHOOK_BASE)
-
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN and ADMIN_ID environment variables are required")
 
-logger.info(f"Mode: {'WEBHOOK' if USE_WEBHOOK else 'POLLING'}")
-if USE_WEBHOOK:
-    logger.info(f"Webhook base: {WEBHOOK_BASE}")
+# Debug: log available env vars (without sensitive values)
+logger.info("=== Environment ===")
+for k in sorted(os.environ.keys()):
+    if k in ('BOT_TOKEN',):
+        logger.info(f"  {k}=***")
+    elif 'DOMAIN' in k or 'URL' in k or 'HOST' in k or 'RAILWAY' in k:
+        logger.info(f"  {k}={os.environ.get(k, '')}")
+logger.info("===================")
 
 # ── Global structures ─────────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -83,24 +80,13 @@ def check_rate_limit(chat_id: int) -> bool:
     rate_limit_cache[chat_id] = now
     return True
 
-# ── Web server (health check + webhook receiver) ────────────────────────────
+# ── Web server (health check ONLY) ───────────────────────────────────────────
 async def health_handler(request):
     return web.Response(text='{"status":"ok","bot":"running"}', content_type="application/json")
-
-async def webhook_handler(request):
-    if request.headers.get('content-type') == 'application/json':
-        json_str = await request.text()
-        try:
-            await bot.process_new_updates([telebot.types.Update.de_json(json_str)])
-        except Exception as e:
-            logger.warning(f"Webhook process error: {e}")
-        return web.Response(text="OK")
-    return web.Response(status=403, text="Forbidden")
 
 async def web_server():
     app = web.Application()
     app.router.add_get('/', health_handler)
-    app.router.add_post(f'/{BOT_TOKEN}', webhook_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
@@ -764,19 +750,30 @@ async def cmd_recheck(message):
         else "Recheck ပြီးပါပြီ။ Success code တစ်ခုမျှ မကျန်ပါ။"
     )
 
-# ── Polling with conflict handling ────────────────────────────────────────
+# ── Robust polling for Railway ────────────────────────────────────────────
 async def start_polling():
-    # Clear any existing webhooks first
-    try:
-        await bot.remove_webhook()
-        logger.info("Webhook removed (switching to polling)")
-        await asyncio.sleep(2)
-    except Exception as e:
-        logger.warning(f"remove_webhook: {e}")
+    # Step 1: Force-remove webhook with retry
+    for i in range(5):
+        try:
+            await bot.remove_webhook()
+            logger.info("Webhook removed successfully")
+            break
+        except Exception as e:
+            logger.warning(f"remove_webhook attempt {i+1} failed: {e}")
+            await asyncio.sleep(2)
+    else:
+        logger.error("Could not remove webhook after 5 attempts")
 
+    # Step 2: Wait for old instances to die (Railway deployment overlap)
+    logger.info("Waiting 10s for old instances to terminate...")
+    await asyncio.sleep(10)
+
+    # Step 3: Start polling
     backoff = 5
+    conflict_count = 0
     while not _shutdown_event.is_set():
         try:
+            logger.info("Starting infinity_polling...")
             await bot.infinity_polling(
                 timeout=30,
                 request_timeout=30,
@@ -788,25 +785,19 @@ async def start_polling():
             await asyncio.sleep(2)
         except Exception as e:
             err_str = str(e)
-            if "Conflict" in err_str or "terminated by other" in err_str:
-                logger.error("409 CONFLICT: Another bot instance is running! Stopping this one.")
-                _shutdown_event.set()
-                return
-            logger.warning(f"Polling error: {e}. Retrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-# ── Webhook setup ─────────────────────────────────────────────────────────
-async def setup_webhook():
-    webhook_path = f"{WEBHOOK_BASE}/{BOT_TOKEN}"
-    try:
-        await bot.remove_webhook()
-        await asyncio.sleep(1)
-        await bot.set_webhook(url=webhook_path, drop_pending_updates=True)
-        logger.info(f"✅ Webhook set: {webhook_path}")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
-        raise
+            if "Conflict" in err_str or "terminated by other" in err_str or "409" in err_str:
+                conflict_count += 1
+                wait_time = min(30 * conflict_count, 120)
+                logger.error(f"409 CONFLICT (#{conflict_count}): Another instance running. Waiting {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                if conflict_count >= 5:
+                    logger.error("Too many conflicts. Shutting down.")
+                    _shutdown_event.set()
+                    return
+            else:
+                logger.warning(f"Polling error: {e}. Retrying in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
 async def cleanup_old_data():
     while not _shutdown_event.is_set():
@@ -839,13 +830,9 @@ async def main():
 
     tasks = [
         asyncio.create_task(web_server()),
+        asyncio.create_task(start_polling()),
         asyncio.create_task(cleanup_old_data()),
     ]
-
-    if USE_WEBHOOK:
-        await setup_webhook()
-    else:
-        tasks.append(asyncio.create_task(start_polling()))
 
     try:
         await _shutdown_event.wait()
@@ -857,11 +844,6 @@ async def main():
                 ct["task"].cancel()
         for t in tasks:
             t.cancel()
-        if USE_WEBHOOK:
-            try:
-                await bot.remove_webhook()
-            except Exception:
-                pass
         await session.close()
         await _connector.close()
         logger.info("Shutdown complete.")
