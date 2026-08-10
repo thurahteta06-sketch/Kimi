@@ -1,0 +1,6 @@
+{
+  "$schema": "https://railpack.com/config/file",
+  "deploy": {
+    "startCommand": "python main.py"
+  }
+}
