@@ -23,11 +23,22 @@ ADMIN_ID    = os.environ.get("ADMIN_ID", "").strip()
 PORT        = int(os.environ.get("PORT", "8080"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "60"))
 
+# Auto-detect Railway domain (Railway sets this automatically)
+RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "").strip()
+
+# Build webhook URL: prefer explicit WEBHOOK_URL, fallback to Railway auto-domain
+WEBHOOK_BASE = WEBHOOK_URL or (f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else "")
+USE_WEBHOOK = bool(WEBHOOK_BASE)
+
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN and ADMIN_ID environment variables are required")
 
+logger.info(f"Mode: {'WEBHOOK' if USE_WEBHOOK else 'POLLING'}")
+if USE_WEBHOOK:
+    logger.info(f"Webhook base: {WEBHOOK_BASE}")
+
 # ── Global structures ─────────────────────────────────────────────────────
-# NO global parse_mode="Markdown" — causes "Can't find end of entity" errors
 bot = AsyncTeleBot(BOT_TOKEN)
 
 user_data        = {}
@@ -59,7 +70,6 @@ BRUTE_MODES = {
 
 # ── Markdown escape helper ────────────────────────────────────────────────
 def escape_md(text):
-    """Escape Telegram Markdown special characters."""
     chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for ch in chars:
         text = text.replace(ch, '\\' + ch)
@@ -73,13 +83,24 @@ def check_rate_limit(chat_id: int) -> bool:
     rate_limit_cache[chat_id] = now
     return True
 
-# ── Web server (health check) ─────────────────────────────────────────────
+# ── Web server (health check + webhook receiver) ────────────────────────────
 async def health_handler(request):
     return web.Response(text='{"status":"ok","bot":"running"}', content_type="application/json")
+
+async def webhook_handler(request):
+    if request.headers.get('content-type') == 'application/json':
+        json_str = await request.text()
+        try:
+            await bot.process_new_updates([telebot.types.Update.de_json(json_str)])
+        except Exception as e:
+            logger.warning(f"Webhook process error: {e}")
+        return web.Response(text="OK")
+    return web.Response(status=403, text="Forbidden")
 
 async def web_server():
     app = web.Application()
     app.router.add_get('/', health_handler)
+    app.router.add_post(f'/{BOT_TOKEN}', webhook_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
@@ -253,7 +274,7 @@ async def Varify_Captcha(session_obj, session_id, text):
 
 async def check_session_url(session_url):
     if not is_safe_url(session_url):
-        logger.warning(f"check_session_url: URL not safe: {session_url}")
+        logger.warning(f"check_session_url: URL not safe")
         return False
     headers = {'accept': 'text/html,*/*;q=0.8',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -743,8 +764,16 @@ async def cmd_recheck(message):
         else "Recheck ပြီးပါပြီ။ Success code တစ်ခုမျှ မကျန်ပါ။"
     )
 
-# ── Polling with better timeout handling ──────────────────────────────────
+# ── Polling with conflict handling ────────────────────────────────────────
 async def start_polling():
+    # Clear any existing webhooks first
+    try:
+        await bot.remove_webhook()
+        logger.info("Webhook removed (switching to polling)")
+        await asyncio.sleep(2)
+    except Exception as e:
+        logger.warning(f"remove_webhook: {e}")
+
     backoff = 5
     while not _shutdown_event.is_set():
         try:
@@ -758,9 +787,26 @@ async def start_polling():
             logger.warning("Polling timeout, reconnecting...")
             await asyncio.sleep(2)
         except Exception as e:
+            err_str = str(e)
+            if "Conflict" in err_str or "terminated by other" in err_str:
+                logger.error("409 CONFLICT: Another bot instance is running! Stopping this one.")
+                _shutdown_event.set()
+                return
             logger.warning(f"Polling error: {e}. Retrying in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+# ── Webhook setup ─────────────────────────────────────────────────────────
+async def setup_webhook():
+    webhook_path = f"{WEBHOOK_BASE}/{BOT_TOKEN}"
+    try:
+        await bot.remove_webhook()
+        await asyncio.sleep(1)
+        await bot.set_webhook(url=webhook_path, drop_pending_updates=True)
+        logger.info(f"✅ Webhook set: {webhook_path}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        raise
 
 async def cleanup_old_data():
     while not _shutdown_event.is_set():
@@ -793,9 +839,13 @@ async def main():
 
     tasks = [
         asyncio.create_task(web_server()),
-        asyncio.create_task(start_polling()),
         asyncio.create_task(cleanup_old_data()),
     ]
+
+    if USE_WEBHOOK:
+        await setup_webhook()
+    else:
+        tasks.append(asyncio.create_task(start_polling()))
 
     try:
         await _shutdown_event.wait()
@@ -807,6 +857,11 @@ async def main():
                 ct["task"].cancel()
         for t in tasks:
             t.cancel()
+        if USE_WEBHOOK:
+            try:
+                await bot.remove_webhook()
+            except Exception:
+                pass
         await session.close()
         await _connector.close()
         logger.info("Shutdown complete.")
