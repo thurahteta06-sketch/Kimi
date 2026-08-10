@@ -21,13 +21,14 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID    = os.environ.get("ADMIN_ID", "").strip()
 PORT        = int(os.environ.get("PORT", "8080"))
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "80"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "60"))
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN and ADMIN_ID environment variables are required")
 
 # ── Global structures ─────────────────────────────────────────────────────
-bot = AsyncTeleBot(BOT_TOKEN, parse_mode="Markdown")
+# NO global parse_mode="Markdown" — causes "Can't find end of entity" errors
+bot = AsyncTeleBot(BOT_TOKEN)
 
 user_data        = {}
 scan_tasks       = {}
@@ -56,6 +57,14 @@ BRUTE_MODES = {
     "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)",     "charset": string.ascii_lowercase + string.digits},
 }
 
+# ── Markdown escape helper ────────────────────────────────────────────────
+def escape_md(text):
+    """Escape Telegram Markdown special characters."""
+    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for ch in chars:
+        text = text.replace(ch, '\\' + ch)
+    return text
+
 # ── Rate limiter ──────────────────────────────────────────────────────────
 def check_rate_limit(chat_id: int) -> bool:
     now = time.monotonic()
@@ -64,21 +73,13 @@ def check_rate_limit(chat_id: int) -> bool:
     rate_limit_cache[chat_id] = now
     return True
 
-# ── Web server (health check + optional webhook) ──────────────────────────
+# ── Web server (health check) ─────────────────────────────────────────────
 async def health_handler(request):
     return web.Response(text='{"status":"ok","bot":"running"}', content_type="application/json")
-
-async def webhook_handler(request):
-    if request.headers.get('content-type') == 'application/json':
-        json_str = await request.text()
-        await bot.process_new_updates([telebot.types.Update.de_json(json_str)])
-        return web.Response(text="OK")
-    return web.Response(status=403, text="Forbidden")
 
 async def web_server():
     app = web.Application()
     app.router.add_get('/', health_handler)
-    app.router.add_post(f'/{BOT_TOKEN}', webhook_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
@@ -252,6 +253,7 @@ async def Varify_Captcha(session_obj, session_id, text):
 
 async def check_session_url(session_url):
     if not is_safe_url(session_url):
+        logger.warning(f"check_session_url: URL not safe: {session_url}")
         return False
     headers = {'accept': 'text/html,*/*;q=0.8',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -265,7 +267,7 @@ async def check_session_url(session_url):
                     return "sessionId" in str(resp.url) or "sessionId" in location
             return "sessionId" in str(first.url) or "sessionId" in location
     except Exception as e:
-        logger.error(f"check_session_url: {e}")
+        logger.error(f"check_session_url error: {type(e).__name__}: {e}")
         return False
 
 # ── Core voucher check ─────────────────────────────────────────────────────
@@ -360,18 +362,23 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         success_texts[chat_id].append({"code": code, "session_id": session_id, "plan": plan_str})
 
         if notify_setting.get(chat_id, True):
-            code_line = "\n".join([f"`{i['code']}` – {i['plan']}" for i in success_texts[chat_id]])
+            code_lines = []
+            for i in success_texts[chat_id]:
+                safe_code = escape_md(i['code'])
+                safe_plan = escape_md(i.get('plan', 'N/A'))
+                code_lines.append(f"`{safe_code}` - {safe_plan}")
+            code_text = "\n".join(code_lines)
             try:
                 if chat_id not in success_messages:
-                    sent = await bot.send_message(chat_id, f"✅ Success Codes:\n{code_line}", parse_mode="Markdown")
+                    sent = await bot.send_message(chat_id, f"✅ Success Codes:\n{code_text}", parse_mode="Markdown")
                     success_messages[chat_id] = sent.message_id
                 else:
                     await bot.edit_message_text(
                         chat_id=chat_id, message_id=success_messages[chat_id],
-                        text=f"✅ Success Codes:\n{code_line}", parse_mode="Markdown"
+                        text=f"✅ Success Codes:\n{code_text}", parse_mode="Markdown"
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send success message: {e}")
         return code
 
     elif 'STA' in response:
@@ -679,13 +686,13 @@ async def cmd_saved(message):
     if success:
         parts.append(f"✅ Success Codes ({len(success)})")
         for item in success:
-            parts.append(f"`{item['code']}` – {item.get('plan', 'N/A')}")
+            parts.append(f"{item['code']} - {item.get('plan', 'N/A')}")
     if limited:
         parts.append(f"\n⚠️ Limited Codes ({len(limited)})")
         parts.extend(limited)
     full_text = "\n".join(parts)
     for i in range(0, len(full_text), 4096):
-        await bot.send_message(chat_id, full_text[i:i+4096], parse_mode="Markdown")
+        await bot.send_message(chat_id, full_text[i:i+4096])
 
 @bot.message_handler(commands=['delete_saved'])
 async def cmd_delete_saved(message):
@@ -736,13 +743,20 @@ async def cmd_recheck(message):
         else "Recheck ပြီးပါပြီ။ Success code တစ်ခုမျှ မကျန်ပါ။"
     )
 
-# ── Polling with auto-reconnect ───────────────────────────────────────────
+# ── Polling with better timeout handling ──────────────────────────────────
 async def start_polling():
     backoff = 5
     while not _shutdown_event.is_set():
         try:
-            await bot.infinity_polling(timeout=20, request_timeout=20)
+            await bot.infinity_polling(
+                timeout=30,
+                request_timeout=30,
+                skip_pending=True
+            )
             return
+        except asyncio.TimeoutError:
+            logger.warning("Polling timeout, reconnecting...")
+            await asyncio.sleep(2)
         except Exception as e:
             logger.warning(f"Polling error: {e}. Retrying in {backoff}s...")
             await asyncio.sleep(backoff)
@@ -759,10 +773,16 @@ async def cleanup_old_data():
 
 async def main():
     global session, _connector
-    _connector = aiohttp.TCPConnector(limit=400, ttl_dns_cache=300, enable_cleanup_closed=True)
-    session    = aiohttp.ClientSession(
+    _connector = aiohttp.TCPConnector(
+        limit=300,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=True,
+    )
+    session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
-        connector=_connector, connector_owner=False
+        connector=_connector,
+        connector_owner=False
     )
 
     loop = asyncio.get_running_loop()
